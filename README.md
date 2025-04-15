@@ -1,3 +1,13 @@
+### https://github.com/cvlab-columbia/pix2gestalt?tab=readme-ov-file#inference-and-weights
+
+pix2gestalt 를 그냥 clone해옴
+
+- 가중치 파일은 빼고
+- 2개의 submodule은 왜 안올라가는지 모르겠지만 안올라감 ㅎ
+
+
+
+
 # pix2gestalt: Amodal Segmentation by Synthesizing Wholes
 ### CVPR 2024 (Highlight)
 ### [Project Page](https://gestalt.cs.columbia.edu/)  | [Paper](https://arxiv.org/pdf/2401.14398.pdf) | [arXiv](https://arxiv.org/abs/2401.14398) | [Weights](https://huggingface.co/cvlab/pix2gestalt-weights) | [Citation](https://github.com/cvlab-columbia/pix2gestalt#citation)
