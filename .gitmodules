@@ -1,0 +1,6 @@
+[submodule "pix2gestalt/CLIP"]
+	path = pix2gestalt/CLIP
+	url = https://github.com/openai/CLIP.git
+[submodule "pix2gestalt/taming-transformers"]
+	path = pix2gestalt/taming-transformers
+	url = https://github.com/CompVis/taming-transformers.git
