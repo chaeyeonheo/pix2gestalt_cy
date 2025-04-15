@@ -35,7 +35,14 @@ def load_model_from_config(config, ckpt, device, verbose=False):
 
 @torch.no_grad()
 def sample_model(input_im, visible_mask, model, sampler, precision, h, w, ddim_steps, n_samples, scale, \
-                 ddim_eta):
+                 ddim_eta, device=None):
+    # device가 None이 아니면 해당 디바이스로 설정
+    if device is not None:
+        input_im = input_im.to(device)
+        visible_mask = visible_mask.to(device)
+    else:
+        device = input_im.device
+        
     precision_scope = autocast if precision=="autocast" else nullcontext
     with precision_scope("cuda"):
         with model.ema_scope():
@@ -51,16 +58,16 @@ def sample_model(input_im, visible_mask, model, sampler, precision, h, w, ddim_s
             """
             Cond Channel 2: VAE(input_im) + VAE(visible_mask)
             """
-            input_im_encoding = model.encode_first_stage((input_im.to(c.device))).mode().detach()
-            visible_mask_encoding = model.encode_first_stage((visible_mask.to(c.device))).mode().detach()
+            input_im_encoding = model.encode_first_stage((input_im.to(device))).mode().detach()
+            visible_mask_encoding = model.encode_first_stage((visible_mask.to(device))).mode().detach()
 
             c_concat = torch.cat((input_im_encoding, visible_mask_encoding), dim = 1)
             cond['c_concat'] = [c_concat.repeat(n_samples, 1, 1, 1)]
      
             if scale != 1.0:
                 uc = {}
-                uc['c_crossattn'] = [torch.zeros_like(c).to(c.device)]
-                uc['c_concat'] = [torch.zeros(n_samples, 8, h // 8, w // 8).to(c.device)]
+                uc['c_crossattn'] = [torch.zeros_like(c).to(device)]
+                uc['c_concat'] = [torch.zeros(n_samples, 8, h // 8, w // 8).to(device)]
             else:
                 uc = None
 
@@ -117,13 +124,17 @@ def run_inference(input_image,
                   model, 
                   guidance_scale, 
                   n_samples, 
-                  ddim_steps):
+                  ddim_steps,
+                  device=None):  # device 매개변수 추가
   rgb_visible_mask = np.zeros((visible_mask.shape[0], visible_mask.shape[1], 3))
   rgb_visible_mask[:,:,0] = visible_mask
   rgb_visible_mask[:,:,1] = visible_mask
   rgb_visible_mask[:,:,2] = visible_mask # (256, 256, 3)
 
-  pred_reconstructions = run_pix2gestalt(model, closure_device, input_image, rgb_visible_mask,
+  # device가 None이면 closure_device 사용, 아니면 주어진 device 사용
+  target_device = device if device is not None else closure_device
+  
+  pred_reconstructions = run_pix2gestalt(model, target_device, input_image, rgb_visible_mask,
                                           scale = guidance_scale, 
                                           n_samples = n_samples, 
                                           ddim_steps = ddim_steps)
@@ -153,7 +164,7 @@ def run_pix2gestalt(
     sampler = DDIMSampler(model)
 
     x_samples_ddim = sample_model(input_im, visible_mask, model, sampler, precision, h, w,\
-                                  ddim_steps, n_samples, scale, ddim_eta)
+                                  ddim_steps, n_samples, scale, ddim_eta, device=device)
     output_ims = []
     for x_sample in x_samples_ddim:
         x_sample = 255. * rearrange(x_sample.cpu().numpy(), 'c h w -> h w c')
