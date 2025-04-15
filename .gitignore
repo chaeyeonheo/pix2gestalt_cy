@@ -2,4 +2,5 @@
 "pix2gestalt/ckpt/*.pth" 
 *.ckpt
 *.pth
+*.png
 
