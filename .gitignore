@@ -1,0 +1,5 @@
+"pix2gestalt/ckpt/*.ckpt" 
+"pix2gestalt/ckpt/*.pth" 
+*.ckpt
+*.pth
+
