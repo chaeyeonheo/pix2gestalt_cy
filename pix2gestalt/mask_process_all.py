@@ -11,10 +11,22 @@ def main():
     parser = argparse.ArgumentParser(description="여러 마스크 정책으로 이미지를 처리")
     parser.add_argument("--input_dir", required=True, help="입력 이미지 디렉토리")
     parser.add_argument("--output_base_dir", required=True, help="출력 기본 디렉토리")
+    
+    # 모든 지원 정책 목록 (box_mask 추가)
+    all_policies = [
+        'random', 'batch_random', 'random_brush', 
+        'seeded_random', 'seeded_brush', 'batch_seeded_random', 'replicated_random',
+        'box_mask', 'box',  # box_mask 추가 (box도 별칭으로 추가)
+        'grid', 'concentric', 'grid_probability', 'uniform_grid', 
+        'box_grid', 'random_box_grid'
+    ]
+    
     parser.add_argument("--policies", nargs='+', 
-                        default=['seeded_random', 'seeded_brush', 'grid', 'concentric',
+                        default=['seeded_random', 'seeded_brush', 'box_mask', 'grid', 'concentric',
                                 'grid_probability', 'uniform_grid', 'box_grid', 'random_box_grid'],
-                        help="사용할 마스크 정책 목록")
+                        choices=all_policies,
+                        help=f"사용할 마스크 정책 목록: {', '.join(all_policies)}")
+    
     parser.add_argument("--mask_ratios", nargs='+', type=float, default=[0.3, 0.5, 0.7],
                         help="사용할 마스크 비율 목록")
     parser.add_argument("--num_images", type=int, default=None, 
@@ -22,6 +34,8 @@ def main():
     parser.add_argument("--num_samples", type=int, default=1, 
                         help="각 이미지당 생성할 샘플 수")
     parser.add_argument("--seed", type=int, default=42, help="랜덤 시드")
+    parser.add_argument("--separate_folders", default=True,
+                        help="마스크된 이미지와 마스크를 별도 폴더에 저장")
     
     args = parser.parse_args()
     
@@ -47,6 +61,10 @@ def main():
             "--seed", str(args.seed),
             "--num_samples", str(args.num_samples)
         ]
+        
+        # 별도 폴더 옵션 추가
+        if args.separate_folders:
+            cmd.append("--separate_folders")
         
         # 이미지 수 제한이 설정된 경우 추가
         if args.num_images is not None:

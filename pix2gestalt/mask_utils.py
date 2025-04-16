@@ -95,6 +95,40 @@ def BatchRandomMask(batch_size, s, hole_range=[0, 1]):
     return np.stack([RandomMask(s, hole_range=hole_range) for _ in range(batch_size)], axis=0)
 
 
+
+def box_mask(shape, device, p, det=False):
+    """
+    박스 형태 마스크 생성 (중앙에 사각형으로 마스킹)
+    
+    Args:
+        shape: 입력 텐서의 shape (batch_size, channels, height, width)
+        device: 텐서가 있는 디바이스
+        p: 마스킹 비율 (0-1)
+        det: 결정적(deterministic) 마스크 여부
+    
+    Returns:
+        마스크 텐서 (1이 보존, 0이 마스크)
+    """
+    assert p <= 1 and p >= 0
+    nb = shape[0]
+    if len(shape) == 2:
+        r = int(shape[-1]**0.5)
+    else:
+        r = shape[-1]
+    mr = int(p * r)
+    mask = np.ones([nb, 1, r, r]).astype(np.int32)
+    for i in range(nb):
+        if det:
+            h = w = (r - mr) // 2
+        else:
+            h, w = np.random.randint(0, r-mr, 2)
+        mask[i, :, h:h+mr, w:w+mr] = 0
+    mask = torch.from_numpy(mask).to(device)
+    if len(shape) == 2:
+        mask = mask.reshape(nb, -1)
+    return mask
+
+
 # 시드 고정 버전의 RandomBrush 함수 추가
 def SeededRandomBrush(
     max_tries,
