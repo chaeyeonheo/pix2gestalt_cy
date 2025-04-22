@@ -1,0 +1,5 @@
+Image: Places365_test_00006352.png
+Found objects: 3
+Successfully completed objects: 3
+Final fill ratio: 0.00%
+Objects used for final result: [1, 2, 3]

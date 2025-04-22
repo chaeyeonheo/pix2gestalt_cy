@@ -1,0 +1,6 @@
+Image: Places365_test_00008107.png
+Found objects: 7
+Successfully completed objects: 4
+Final fill ratio: 0.00%
+Best object: 1
+Mask overlap ratio: 0.1286

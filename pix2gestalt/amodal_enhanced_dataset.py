@@ -1,409 +1,430 @@
+import os
+import sys
+import argparse
 import numpy as np
 import torch
 import cv2
-import os
-import sys
-import time
-import glob
 from PIL import Image
 from tqdm import tqdm
 import gc
+import shutil
 from omegaconf import OmegaConf
 import multiprocessing as mp
-import argparse
-import math
-import uuid
-import matplotlib.pyplot as plt
 
-# inference.py에서 필요한 함수들 가져오기
+# 필요한 모듈 임포트
 from inference import load_model_from_config, get_sam_predictor, run_sam, run_inference
+from segment_anything import SamAutomaticMaskGenerator
 
 def save_debug_image(img, path):
-    """디버깅용 이미지 저장 함수"""
+    """디버그 이미지를 저장하는 헬퍼 함수"""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     if isinstance(img, np.ndarray):
         if img.dtype == bool:
             img = img.astype(np.uint8) * 255
-        if len(img.shape) == 2:  # 그레이스케일 마스크인 경우
-            # 3채널 RGB로 변환
-            rgb_img = np.zeros((img.shape[0], img.shape[1], 3), dtype=np.uint8)
-            rgb_img[:, :, 0] = img
-            rgb_img[:, :, 1] = img
-            rgb_img[:, :, 2] = img
-            Image.fromarray(rgb_img).save(path)
+        if img.ndim == 2:
+            rgb = np.stack([img]*3, axis=-1)
+            Image.fromarray(rgb).save(path)
         else:
             Image.fromarray(img).save(path)
     else:
         img.save(path)
 
-def visualize_mask_on_image(image, mask, alpha=0.5, color=(0, 255, 0)):
+def visualize_mask_on_image(image, mask, alpha=0.5, color=(0,255,0)):
     """마스크를 이미지 위에 시각화하는 함수"""
-    # 이미지와 마스크가 NumPy 배열인지 확인
     if not isinstance(image, np.ndarray):
         image = np.array(image)
-    if not isinstance(mask, np.ndarray):
-        mask = np.array(mask)
-    
-    # 마스크가 불리언 타입이면 0과 1로 변환
-    if mask.dtype == bool:
-        mask = mask.astype(np.uint8)
-    
-    # 마스크가 1채널이면 3채널로 변환
-    if len(mask.shape) == 2:
-        color_mask = np.zeros((mask.shape[0], mask.shape[1], 3), dtype=np.uint8)
-        color_mask[mask > 0] = color
-    else:
-        color_mask = mask
-    
-    # 합성 이미지 생성
-    blended = cv2.addWeighted(image, 1, color_mask, alpha, 0)
-    return blended
+    mask_uint = mask.astype(np.uint8) if mask.dtype==bool else mask
+    cm = np.zeros((*mask_uint.shape,3), dtype=np.uint8)
+    cm[mask_uint>0] = color
+    return cv2.addWeighted(image, 1, cm, alpha, 0)
 
-def generate_grid_points(mask, h, w, grid_size=16):
-    """그리드 포인트 생성 함수"""
-    points = []
-    for y in range(grid_size, h, grid_size):
-        for x in range(grid_size, w, grid_size):
-            # 가시적인 영역의 포인트만 사용
-            if not mask[y, x]:
-                points.append(([x, y], 1))  # 전경 포인트
-    return points
+def find_objects_in_image(sam_predictor, img, orig_mask, name, debug_dir):
+    """
+    SAM으로부터 객체 후보 마스크를 뽑아오는 함수
+    1) manual 전략: boundary / 4-quadrant / center / sparse
+    2) automatic mask generator
+    3) 마스크 영역과 80% 이상 겹치면 제외 (그 외 모든 마스크 허용)
+    """
+    h, w = img.shape[:2]
+    objs = []
+
+    def accept(m):
+        """
+        마스크 필터링 함수:
+        마스크 영역과 80% 이상 겹치면 제외 (마스크 자체를 객체로 인식한 경우)
+        그 외 모든 마스크는 허용
+        """
+        # 마스크와 겹치는 비율 계산
+        m_sum = np.sum(m)
+        if m_sum == 0:
+            return False
+            
+        overlap = m & orig_mask
+        overlap_ratio = np.sum(overlap) / m_sum
+        
+        # 마스크 영역과 80% 이상 겹치면 제외 (나머지는 모두 허용)
+        return overlap_ratio < 0.8
+
+    # 모든 전략의 마스크를 저장할 리스트
+    all_masks = []
+    
+    # 1) Boundary-based points
+    ker = np.ones((5, 5), np.uint8)
+    b = cv2.dilate(orig_mask.astype(np.uint8)*255, ker, 2) \
+      - cv2.erode (orig_mask.astype(np.uint8)*255, ker, 2)
+    ys, xs = np.where(b > 0)
+    pts = []
+    for i in range(min(len(ys), 100)):
+        y, x = ys[i], xs[i]
+        for dy, dx in [(-3,0),(3,0),(0,-3),(0,3)]:
+            ny, nx = y+dy, x+dx
+            if 0 <= ny < h and 0 <= nx < w and not orig_mask[ny,nx]:
+                pts.append(([nx, ny], 1))
+    if pts:
+        m, _ = run_sam(sam_predictor, pts[:30])
+        if m is not None and m.max()>0:
+            mb = (m>0)
+            print(f"[DEBUG][{name}] boundary SAM mask size = {mb.sum()}")
+            save_debug_image(mb.astype(np.uint8)*255,
+                             os.path.join(debug_dir, 'sam_masks', f"{name}_boundary.png"))
+            all_masks.append(("boundary", mb))
+
+    # 2) 4-Quadrant centers
+    regions = [
+        (0, 0, w//2, h//2),
+        (w//2, 0, w, h//2),
+        (0, h//2, w//2, h),
+        (w//2, h//2, w, h)
+    ]
+    for idx, (x1,y1,x2,y2) in enumerate(regions):
+        cx, cy = (x1+x2)//2, (y1+y2)//2
+        if not orig_mask[cy, cx]:
+            m, _ = run_sam(sam_predictor, [([cx, cy],1)])
+            if m is not None and m.max()>0:
+                mb = (m>0)
+                print(f"[DEBUG][{name}] region{idx}@({cx},{cy}) SAM mask size = {mb.sum()}")
+                save_debug_image(mb.astype(np.uint8)*255,
+                                 os.path.join(debug_dir, 'sam_masks', f"{name}_reg{idx}_{cx}_{cy}.png"))
+                all_masks.append((f"region{idx}", mb))
+
+    # 3) Image center
+    cx, cy = w//2, h//2
+    if not orig_mask[cy, cx]:
+        m, _ = run_sam(sam_predictor, [([cx, cy],1)])
+        if m is not None and m.max()>0:
+            mb = (m>0)
+            print(f"[DEBUG][{name}] center@({cx},{cy}) SAM mask size = {mb.sum()}")
+            save_debug_image(mb.astype(np.uint8)*255,
+                             os.path.join(debug_dir, 'sam_masks', f"{name}_center.png"))
+            all_masks.append(("center", mb))
+
+    # 4) Sparse grid sampling
+    step = min(h, w)//8
+    sparse_pts = []
+    for y in range(step, h, step*2):
+        for x in range(step, w, step*2):
+            if not orig_mask[y, x]:
+                sparse_pts.append(([x, y], 1))
+    for i in range(0, len(sparse_pts), 5):
+        batch = sparse_pts[i:i+5]
+        if not batch:
+            continue
+        m, _ = run_sam(sam_predictor, batch)
+        if m is not None and m.max()>0:
+            mb = (m>0)
+            print(f"[DEBUG][{name}] sparse#{i} SAM mask size = {mb.sum()}")
+            save_debug_image(mb.astype(np.uint8)*255,
+                             os.path.join(debug_dir, 'sam_masks', f"{name}_sparse_{i}.png"))
+            all_masks.append((f"sparse{i}", mb))
+
+    # 5) AutomaticMaskGenerator로 이미지 전체 탐색
+    auto_gen = SamAutomaticMaskGenerator(
+        sam_predictor.model,
+        points_per_side=32,
+        pred_iou_thresh=0.86,
+        stability_score_thresh=0.92,
+        box_nms_thresh=0.7,
+        crop_n_layers=0,
+        min_mask_region_area=100
+    )
+    all_anns = auto_gen.generate(img)
+    for idx, ann in enumerate(all_anns, start=1):
+        m = ann["segmentation"].astype(bool)
+        print(f"[DEBUG][{name}] auto#{idx} mask size = {m.sum()}")
+        save_debug_image(m.astype(np.uint8)*255,
+                         os.path.join(debug_dir, 'sam_masks', f"{name}_auto_{idx}.png"))
+        all_masks.append((f"auto{idx}", m))
+
+    # 모든 마스크에 대한 시각화
+    all_masks_img = np.zeros_like(img)
+    for i, (mask_name, mask) in enumerate(all_masks):
+        color = [(i*50)%255, ((i*30)+100)%255, ((i*70)+150)%255]
+        all_masks_img = visualize_mask_on_image(all_masks_img, mask, alpha=0.3, color=color)
+    save_debug_image(all_masks_img, os.path.join(debug_dir, 'all_detected_masks.png'))
+
+    # 필터 적용
+    accepted_masks = []
+    for mask_name, mask in all_masks:
+        if accept(mask):
+            m_sum = np.sum(mask)
+            overlap = mask & orig_mask
+            overlap_ratio = np.sum(overlap) / m_sum if m_sum > 0 else 0
+            print(f"[DEBUG][{name}] Accepted {mask_name}, overlap_ratio={overlap_ratio:.2f}")
+            
+            # 마스크 영역과 겹치는 부분 있는지 확인 (디버깅용)
+            has_overlap = np.any(overlap)
+            if has_overlap:
+                print(f"[DEBUG][{name}] {mask_name} 마스크가 원본 마스크와 겹치는 영역 있음")
+            else:
+                print(f"[DEBUG][{name}] {mask_name} 마스크가 원본 마스크와 겹치지 않음")
+                
+            accepted_masks.append(mask)
+        else:
+            m_sum = np.sum(mask)
+            overlap = mask & orig_mask
+            overlap_ratio = np.sum(overlap) / m_sum if m_sum > 0 else 0
+            print(f"[DEBUG][{name}] Rejected {mask_name}, overlap_ratio={overlap_ratio:.2f}")
+
+    # 필터 후 마스크 시각화
+    if accepted_masks:
+        accepted_img = np.zeros_like(img)
+        for i, mask in enumerate(accepted_masks):
+            color = [(i*50)%255, ((i*30)+100)%255, ((i*70)+150)%255]
+            accepted_img = visualize_mask_on_image(accepted_img, mask, alpha=0.3, color=color)
+        save_debug_image(accepted_img, os.path.join(debug_dir, 'accepted_masks.png'))
+        
+        # 원본 이미지 위에 수락된 마스크 오버레이
+        overlay_img = img.copy()
+        for i, mask in enumerate(accepted_masks):
+            color = [(i*50)%255, ((i*30)+100)%255, ((i*70)+150)%255]
+            overlay_img = visualize_mask_on_image(overlay_img, mask, alpha=0.3, color=color)
+        save_debug_image(overlay_img, os.path.join(debug_dir, 'original_with_accepted_masks.png'))
+
+    print(f"[INFO][{name}] 감지된 마스크 수: {len(all_masks)}, 수락된 마스크 수: {len(accepted_masks)}")
+    return accepted_masks
 
 def process_batch(args):
-    """
-    GPU 한 개에서 처리할 배치를 처리하는 함수
-    """
-    batch_files, input_dir, output_dir, model_config_path, model_ckpt_path, sam_model_type, device_id, guidance_scale, ddim_steps, grid_size = args
-    
-    # 디버깅 디렉토리 설정
-    debug_dir = os.path.join(output_dir, 'debug')
-    sam_masks_dir = os.path.join(debug_dir, 'sam_masks')
-    completion_dir = os.path.join(debug_dir, 'completions')
-    overlay_dir = os.path.join(debug_dir, 'overlays')
-    filled_masks_dir = os.path.join(output_dir, 'filled_masks')  # 최종 채워진 마스크를 저장할 별도 폴더
-    
-    # 필요한 디렉토리 생성
-    os.makedirs(sam_masks_dir, exist_ok=True)
-    os.makedirs(completion_dir, exist_ok=True)
-    os.makedirs(overlay_dir, exist_ok=True)
-    os.makedirs(filled_masks_dir, exist_ok=True)
-    
-    # 현재 프로세스에 GPU 디바이스 할당
-    device = f'cuda:{device_id}' if torch.cuda.is_available() else 'cpu'
-    print(f"프로세스 시작: GPU {device_id}, 처리할 이미지 수: {len(batch_files)}")
-    
-    # 모델 로드
-    config = OmegaConf.load(model_config_path)
-    model = load_model_from_config(config, model_ckpt_path, device)
-    
-    # SAM 예측기 가져오기
-    sam_predictor = get_sam_predictor(model_type=sam_model_type, device=device)
-    
-    # 각 이미지 처리
-    for img_file in tqdm(batch_files, desc=f"GPU {device_id} 처리 중"):
-        img_path = os.path.join(input_dir, img_file)
-        output_path = os.path.join(output_dir, img_file)
-        filled_mask_path = os.path.join(filled_masks_dir, f"{os.path.splitext(img_file)[0]}_filled_mask.png")
+    imgs, inp_dir, out_dir, cfg, ckpt, sam_type, dev, gs, steps = args
+    debug_root = os.path.join(out_dir,'debug'); os.makedirs(debug_root,exist_ok=True)
+    final_dir = os.path.join(out_dir,'final'); os.makedirs(final_dir,exist_ok=True)
+    masks_dir = os.path.join(out_dir,'filled_masks'); os.makedirs(masks_dir,exist_ok=True)
+    interim_dir = os.path.join(out_dir,'interim'); os.makedirs(interim_dir,exist_ok=True)
+
+    device = f'cuda:{dev}' if torch.cuda.is_available() else 'cpu'
+    model = load_model_from_config(OmegaConf.load(cfg), ckpt, device)
+    sam   = get_sam_predictor(model_type=sam_type, device=device)
+
+    for fn in tqdm(imgs, desc=f"GPU{dev}"):
+        name, _ = os.path.splitext(fn)
+        dr = os.path.join(debug_root, name)
         
-        try:
-            # 이미지 로드
-            input_image = cv2.imread(img_path)
-            if input_image is None:
-                print(f"이미지를 불러올 수 없습니다: {img_path}")
-                continue
-                
-            input_image = cv2.cvtColor(input_image, cv2.COLOR_BGR2RGB)
+        # 디버그 디렉토리 재생성
+        if os.path.exists(dr):
+            shutil.rmtree(dr)
+        os.makedirs(dr, exist_ok=True)
             
-            # 마스크 생성 (흰색/검은색 영역이 마스킹됨을 가정)
-            white_mask = np.all(input_image == 255, axis=2)
-            black_mask = np.all(input_image == 0, axis=2)
-            mask = white_mask | black_mask
-            
-            # 이진 마스크로 변환 (마스킹된 영역은 1, 가시적인 영역은 0)
-            binary_mask = mask.astype(np.uint8) * 255
-            
-            # 디버깅: 원본 마스크 저장
-            mask_debug_path = os.path.join(debug_dir, f"{os.path.splitext(img_file)[0]}_original_mask.png")
-            save_debug_image(binary_mask, mask_debug_path)
-            
-            # 마스크가 없으면 다음 이미지로
-            if binary_mask.sum() == 0:
-                print(f"{img_file}에 마스크가 없습니다. 원본 이미지를 복사합니다.")
-                output_img = Image.fromarray(input_image)
-                output_img.save(output_path)
-                continue
-            
-            # SAM 이미지 설정
-            sam_predictor.set_image(input_image)
-            
-            # 결과 이미지 (입력 이미지로 초기화)
-            result_image = input_image.copy()
-            
-            # 채워진 마스크 픽셀 추적
-            filled_mask = np.zeros_like(binary_mask)
-            
-            # 그리드 포인트 생성 (더 촘촘하게)
-            h, w = input_image.shape[:2]
-            points = generate_grid_points(mask, h, w, grid_size)
-            
-            # 테두리에 더 많은 포인트 추가 (마스크 근처에서의 감지를 향상)
-            kernel = np.ones((5, 5), np.uint8)
-            mask_boundary = cv2.dilate(binary_mask, kernel, iterations=2) - cv2.erode(binary_mask, kernel, iterations=2)
-            
-            # 마스크 경계 근처의 가시적인 영역에 포인트 추가
-            boundary_points = []
-            ys, xs = np.where(mask_boundary > 0)
-            for i in range(len(ys)):
-                y, x = ys[i], xs[i]
-                # 마스크 경계 주변의 가시적인 영역에 포인트 추가
-                for dy in [-3, -2, -1, 0, 1, 2, 3]:
-                    for dx in [-3, -2, -1, 0, 1, 2, 3]:
-                        ny, nx = y + dy, x + dx
-                        if 0 <= ny < h and 0 <= nx < w and not mask[ny, nx]:
-                            boundary_points.append(([nx, ny], 1))
-            
-            # 중복 제거 및 포인트 추가
-            unique_boundary_points = []
-            boundary_coords = set()
-            for point, label in boundary_points:
-                coord = (point[0], point[1])
-                if coord not in boundary_coords:
-                    boundary_coords.add(coord)
-                    unique_boundary_points.append((point, label))
-            
-            points.extend(unique_boundary_points)
-            
-            if len(points) == 0:
-                print(f"{img_file}에 가시적인 영역이 없습니다. 원본 이미지를 복사합니다.")
-                output_img = Image.fromarray(input_image)
-                output_img.save(output_path)
-                continue
-            
-            print(f"SAM 프롬프트용 {len(points)}개 포인트 생성됨 (이미지: {img_file})")
-            
-            # 메모리 문제를 피하기 위해 작은 배치로 처리
-            batch_points = [points[i:i+10] for i in range(0, len(points), 10)]
-            
-            # 객체 인덱스 추적
-            object_idx = 0
-            has_successful_completion = False
-            
-            for point_batch in batch_points:
-                if not point_batch:
-                    continue
-                    
-                try:
-                    # 이 배치의 포인트에 대한 가시적 마스크 가져오기
-                    visible_mask, overlay_masks = run_sam(sam_predictor, point_batch)
-                    
-                    # 유효한 마스크가 생성되지 않으면 건너뜀
-                    if visible_mask is None or visible_mask.max() == 0:
-                        continue
-                    
-                    # 객체 인덱스 증가
-                    object_idx += 1
-                    
-                    # 디버깅: SAM 마스크 저장
-                    sam_mask_path = os.path.join(sam_masks_dir, f"{os.path.splitext(img_file)[0]}_obj{object_idx}_mask.png")
-                    save_debug_image(visible_mask, sam_mask_path)
-                    
-                    # SAM 마스크 오버레이 저장
-                    overlay_img = visualize_mask_on_image(input_image, visible_mask > 0)
-                    overlay_path = os.path.join(overlay_dir, f"{os.path.splitext(img_file)[0]}_obj{object_idx}_overlay.png")
-                    save_debug_image(overlay_img, overlay_path)
-                    
-                    # pix2gestalt를 실행하여 객체 완성
-                    completions = run_inference(
-                        input_image,
-                        visible_mask,
-                        model,
-                        guidance_scale,
-                        n_samples=1,  # 샘플 하나만 생성
-                        ddim_steps=ddim_steps,
-                        device=device
-                    )
-                    
-                    if completions and len(completions) > 0:
-                        completion = completions[0]
-                        
-                        # 디버깅: 완성된 객체 저장
-                        completion_path = os.path.join(completion_dir, f"{os.path.splitext(img_file)[0]}_obj{object_idx}_completion.png")
-                        save_debug_image(completion, completion_path)
-                        
-                        # 마스크된 영역만 업데이트
-                        update_mask = np.logical_and(visible_mask > 0, binary_mask > 0)
-                        update_mask = np.logical_and(update_mask, ~filled_mask)
-                        
-                        # 디버깅: 업데이트 마스크 저장
-                        update_mask_path = os.path.join(debug_dir, f"{os.path.splitext(img_file)[0]}_obj{object_idx}_update_mask.png")
-                        save_debug_image(update_mask.astype(np.uint8) * 255, update_mask_path)
-                        
-                        # 마스크된 영역 업데이트
-                        if np.any(update_mask):
-                            # 업데이트 마스크 영역에만 완성된 이미지 적용
-                            for c in range(3):  # RGB 채널
-                                result_image[:,:,c] = np.where(update_mask, completion[:,:,c], result_image[:,:,c])
-                            
-                            # 채워진 마스크 업데이트
-                            filled_mask = np.logical_or(filled_mask, update_mask)
-                            has_successful_completion = True
-                            
-                            # 디버깅: 현재까지의 결과 저장
-                            interim_result_path = os.path.join(debug_dir, f"{os.path.splitext(img_file)[0]}_interim_result_obj{object_idx}.png")
-                            save_debug_image(result_image, interim_result_path)
-                    
-                except Exception as e:
-                    print(f"포인트 배치 처리 중 오류 발생: {e}")
-                    continue
-                
-                # 메모리 정리
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            
-            # 채워진 비율 계산
-            fill_ratio = np.sum(filled_mask) / np.sum(binary_mask) * 100
-            
-            # 디버깅: 최종 채워진 마스크를 별도 폴더에 저장
-            save_debug_image(filled_mask.astype(np.uint8) * 255, filled_mask_path)
-            
-            # 결과 이미지 항상 저장 (충분히 채워지지 않았더라도)
-            output_img = Image.fromarray(result_image)
-            output_img.save(output_path)
-            
-            print(f"GPU {device_id}: {img_file} 처리 완료. 마스크 영역의 {fill_ratio:.2f}% 채워짐")
-            
-        except Exception as e:
-            print(f"이미지 {img_file} 처리 중 오류 발생: {e}")
+        for sub in ['sam_masks', 'mask_input', 'comps', 'interim', 'over', 'masks']:
+            os.makedirs(os.path.join(dr, sub), exist_ok=True)
+
+        img = cv2.imread(os.path.join(inp_dir, fn))
+        if img is None: 
+            print(f"[ERROR] 이미지를 불러올 수 없습니다: {fn}")
             continue
-    
-    # 최종 정리
-    del model, sam_predictor
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    
+            
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        white = np.all(img==255, axis=2)
+        black = np.all(img==0, axis=2)
+        orig_mask = white | black
+
+        save_debug_image(orig_mask.astype(np.uint8)*255, os.path.join(dr, 'mask.png'))
+        save_debug_image(img, os.path.join(dr, 'orig.png'))
+
+        # 초기화 - 원본 이미지로 시작
+        composite = img.copy()
+        filled = np.zeros_like(orig_mask, dtype=bool)
+
+        if orig_mask.sum() == 0:
+            print(f"[INFO] 마스크가 없음: {fn}")
+            Image.fromarray(img).save(os.path.join(final_dir, fn))
+            continue
+
+        sam.set_image(img)
+        objs = find_objects_in_image(sam, img, orig_mask, name, dr)
+
+        if len(objs) == 0:
+            print(f"[WARNING] 적합한 객체가 없음: {fn}")
+            Image.fromarray(img).save(os.path.join(final_dir, fn))
+            continue
+
+        # 모든 객체에 대한 완성 이미지를 수집
+        completion_images = []
+        
+        for i, mask_bool in enumerate(objs, start=1):
+            # debug: masked input to amodal
+            masked_in = img.copy()
+            for c in range(3):
+                masked_in[:,:,c] = np.where(mask_bool, img[:,:,c], 0)
+            save_debug_image(masked_in, os.path.join(dr, 'mask_input', f"{i}.png"))
+
+            # overlay
+            ov = visualize_mask_on_image(img, mask_bool)
+            save_debug_image(ov, os.path.join(dr, 'over', f"{i}.png"))
+
+            # mask_bool 마스크 저장
+            save_debug_image(mask_bool.astype(np.uint8)*255, os.path.join(dr, 'masks',f"{i}.png"))
+
+            # run_inference
+            print(f"[DEBUG][{name}] run_inference with mask {i}, pixels={mask_bool.sum()}")
+            comps = run_inference(img, mask_bool, model, gs, n_samples=1, ddim_steps=steps, device=device)
+            print(f"[DEBUG][{name}] run_inference returned {len(comps)} samples")
+            
+            if not comps or len(comps) == 0: 
+                print(f"[WARNING] 완성 결과 없음: {name}, 객체 {i}")
+                continue
+                
+            comp = comps[0]
+            # 데이터 타입 확인 및 변환
+            if comp.dtype != np.uint8:
+                print(f"[DEBUG][{name}] comp 데이터 타입 변환: {comp.dtype} -> uint8")
+                if comp.max() <= 1.0:
+                    comp = (comp * 255).astype(np.uint8)
+                else:
+                    comp = np.clip(comp, 0, 255).astype(np.uint8)
+            
+            save_debug_image(comp, os.path.join(dr, 'comps', f"{i}.png"))
+            
+            # 흰색이 아닌 픽셀 확인 (의미있는 생성인지 확인)
+            non_white_mask = ~np.all(comp > 240, axis=2)
+            non_white_count = np.sum(non_white_mask)
+            print(f"[DEBUG][{name}] 흰색이 아닌 픽셀 수: {non_white_count}")
+            
+            # 흰색 픽셀만 있는 경우 스킵
+            if non_white_count < 100:
+                print(f"[INFO] 생성된 이미지가 대부분 흰색입니다: {name}, 객체 {i}")
+                continue
+            
+            # 유효한 완성 이미지 저장
+            completion_images.append(comp)
+            
+            # 중간 결과 저장 (개별 객체별 완성 이미지)
+            interim_path = os.path.join(interim_dir, f"{name}_obj{i}.png")
+            Image.fromarray(comp).save(interim_path)
+            print(f"[INFO] 객체 {i} 완성 이미지 저장: {interim_path}")
+        
+        # 완성 이미지가 없는 경우
+        if not completion_images:
+            print(f"[WARNING] 유효한 완성 이미지가 없음: {name}")
+            Image.fromarray(img).save(os.path.join(final_dir, fn))
+            continue
+        
+        # ==================== 새로운 합성 로직 시작 ====================
+        
+        # 1) 마스크 이미지 읽기 & composite 초기화
+        mask = np.zeros((img.shape[0], img.shape[1]), dtype=np.uint8)
+        mask[orig_mask] = 255  # 흰색/검은색 영역을 255로 설정
+        inv_mask = cv2.bitwise_not(mask)
+        
+        # 합성 이미지 초기화 (원본 이미지로 시작)
+        composite = img.copy()
+        
+        # 2) 모든 완성 이미지를 순차적으로 중첩
+        for idx, comp_img in enumerate(completion_images, start=1):
+            # 3) 완성 이미지에서 순수 흰/검은 픽셀 마스크
+            white_px = np.all(comp_img == 255, axis=2).astype(np.uint8) * 255
+            black_px = np.all(comp_img == 0, axis=2).astype(np.uint8) * 255
+            no_fill = cv2.bitwise_or(white_px, black_px)    # 흰색 또는 검은색인 곳
+            valid_px = cv2.bitwise_not(no_fill)             # 덧씌울 수 있는 픽셀
+            
+            # 4) 최종 적용 마스크 = 원래 mask 영역 ∧ valid_px
+            apply_mask = cv2.bitwise_and(mask, valid_px)
+            
+            # 4-1) 디버그: 적용 마스크 저장
+            save_debug_image(apply_mask, os.path.join(dr, 'masks', f"apply_mask_{idx}.png"))
+            
+            # 4-2) composite 갱신
+            new_part = cv2.bitwise_and(comp_img, comp_img, mask=apply_mask)
+            keep_part = cv2.bitwise_and(composite, composite, mask=cv2.bitwise_not(apply_mask))
+            composite = cv2.add(new_part, keep_part)
+            
+            # 4-3) 중간 결과 저장 
+            interim_path = os.path.join(dr, 'interim', f"composite_{idx}.png")
+            save_debug_image(composite, interim_path)
+            print(f"[INFO] 중간 합성 결과 저장: {interim_path}")
+            
+            # 4-4) 마스크 업데이트 (이미 채워진 부분은 제외)
+            mask = cv2.bitwise_and(mask, cv2.bitwise_not(apply_mask))
+        
+        # 5) 최종 결과 저장
+        save_debug_image(composite, os.path.join(dr, 'final_composite.png'))
+        Image.fromarray(composite).save(os.path.join(final_dir, fn))
+        
+        # ==================== 새로운 합성 로직 끝 ====================
+        
+        # 채워진 마스크 비율 계산
+        filled_mask = cv2.bitwise_xor(orig_mask.astype(np.uint8)*255, mask)
+        fill_ratio = np.sum(filled_mask) / np.sum(orig_mask.astype(np.uint8)*255) * 100 if np.sum(orig_mask) > 0 else 0
+        
+        # 최종 채워진 마스크 저장
+        save_debug_image(filled_mask, os.path.join(masks_dir, f"{name}_mask.png"))
+        print(f"[INFO][GPU{dev}] 저장 완료: final/{fn}, 채움 비율={fill_ratio:.2f}%")
+        
+        # 메모리 정리
+        gc.collect()
+        if torch.cuda.is_available(): torch.cuda.empty_cache()
+
     return True
 
-
-def create_amodal_enhanced_dataset_distributed(
-    input_dir,           # 마스킹된 이미지가 있는 디렉토리
-    output_dir,          # 향상된 이미지를 저장할 디렉토리
-    model_config_path=None,   # pix2gestalt 모델 설정 경로
-    model_ckpt_path=None,     # pix2gestalt 모델 체크포인트 경로
-    sam_model_type='vit_h', # SAM 모델 타입
-    guidance_scale=2.0,  # 확산 가이던스 스케일
-    ddim_steps=50,       # 확산 스텝 수
-    grid_size=16,        # 그리드 포인트의 간격
-    num_gpus=8,          # 사용할 GPU 수
-    max_images=None      # 처리할 최대 이미지 수 (None이면 모든 이미지 처리)
-):
-    # 기본 경로 설정 (제공되지 않은 경우)
-    if model_config_path is None:
-        model_config_path = './configs/sd-finetune-pix2gestalt-c_concat-256.yaml' # 기본 설정 파일 경로
-    if model_ckpt_path is None:
-        model_ckpt_path = './ckpt/epoch=000005.ckpt'  # 기본 체크포인트 경로
+def create_dataset(inp, out, cfg=None, ckpt=None, sam_model='vit_h', gs=2.0, steps=50, gpus=4, max_imgs=None):
+    cfg = cfg or './configs/sd-finetune-pix2gestalt-c_concat-256.yaml'
+    ckpt= ckpt or './ckpt/epoch=000005.ckpt'
+    files = sorted([f for f in os.listdir(inp) if f.lower().endswith(('.png','.jpg','.jpeg'))])
+    if max_imgs: files=files[:max_imgs]
+    print(f"총 {len(files)}개 이미지를 처리합니다.")
     
-    # 출력 디렉토리가 없으면 생성
-    os.makedirs(output_dir, exist_ok=True)
+    ng=torch.cuda.device_count(); g = min(gpus,ng) if ng>0 else 1
+    print(f"사용 가능한 GPU: {ng}개, 실제 사용: {g}개")
     
-    # 디버깅 디렉토리 생성
-    debug_dir = os.path.join(output_dir, 'debug')
-    os.makedirs(debug_dir, exist_ok=True)
-    os.makedirs(os.path.join(debug_dir, 'sam_masks'), exist_ok=True)
-    os.makedirs(os.path.join(debug_dir, 'completions'), exist_ok=True)
-    os.makedirs(os.path.join(debug_dir, 'overlays'), exist_ok=True)
-    os.makedirs(os.path.join(output_dir, 'filled_masks'), exist_ok=True)  # 최종 채워진 마스크를 저장할 별도 폴더
+    bs=len(files)//g
+    if bs == 0:
+        bs = 1
     
-    # 사용할 GPU 수 확인
-    available_gpus = torch.cuda.device_count()
-    if available_gpus < num_gpus:
-        print(f"요청한 GPU 수({num_gpus})가 사용 가능한 GPU 수({available_gpus})보다 많습니다. 사용 가능한 모든 GPU를 사용합니다.")
-        num_gpus = available_gpus
+    batches=[]
+    for i in range(g):
+        st,en=i*bs,min((i+1)*bs,len(files))
+        if st>=len(files): break
+        batches.append((files[st:en], inp, out, cfg, ckpt, sam_model, i, gs, steps))
     
-    if num_gpus == 0:
-        print("사용 가능한 GPU가 없습니다. CPU를 사용합니다.")
-        num_gpus = 1  # CPU 모드
+    print(f"{g}개의 GPU로 분산 처리를 시작합니다.")
     
-    # 이미지 파일 목록 가져오기
-    image_files = [f for f in os.listdir(input_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp'))]
+    if g == 1:
+        process_batch(batches[0])
+    else:
+        with mp.Pool(g) as p:
+            p.map(process_batch, batches)
     
-    # 처리할 이미지 수 제한
-    if max_images is not None and max_images > 0 and max_images < len(image_files):
-        image_files = image_files[:max_images]
-        print(f"전체 {len(os.listdir(input_dir))}개 이미지 중 {max_images}개만 처리합니다.")
-    
-    total_images = len(image_files)
-    print(f"총 {total_images}개 이미지를 처리합니다.")
-    
-    if total_images == 0:
-        print("처리할 이미지가 없습니다.")
-        return
-    
-    # 각 GPU가 처리할 이미지 배치 생성
-    images_per_gpu = math.ceil(total_images / num_gpus)
-    batches = []
-    
-    for gpu_id in range(num_gpus):
-        start_idx = gpu_id * images_per_gpu
-        end_idx = min(start_idx + images_per_gpu, total_images)
-        
-        if start_idx >= total_images:
-            break
-            
-        batch_files = image_files[start_idx:end_idx]
-        batches.append((
-            batch_files, 
-            input_dir, 
-            output_dir, 
-            model_config_path, 
-            model_ckpt_path, 
-            sam_model_type, 
-            gpu_id, 
-            guidance_scale, 
-            ddim_steps,
-            grid_size
-        ))
-    
-    # 프로세스 풀 생성 및 배치 처리 시작
-    print(f"{num_gpus}개의 GPU로 분산 처리를 시작합니다.")
-    start_time = time.time()
-    
-    # 멀티프로세싱 풀 생성 및 배치 처리
-    with mp.Pool(processes=num_gpus) as pool:
-        results = pool.map(process_batch, batches)
-    
-    elapsed_time = time.time() - start_time
-    print(f"모든 처리 완료: {elapsed_time:.2f}초 소요됨")
-
+    print(f"모든 처리 완료")
 
 def main():
-    parser = argparse.ArgumentParser(description='아모달 세그멘테이션을 활용한 인페인팅 데이터셋 생성 (다중 GPU 버전)')
-    parser.add_argument('--input_dir', type=str, required=True, help='마스킹된 이미지가 있는 디렉토리')
-    parser.add_argument('--output_dir', type=str, required=True, help='향상된 이미지를 저장할 디렉토리')
-    parser.add_argument('--model_config', type=str, default='./configs/sd-finetune-pix2gestalt-c_concat-256.yaml', help='pix2gestalt 모델 설정 경로')
-    parser.add_argument('--model_ckpt', type=str, default='./ckpt/epoch=000005.ckpt', help='pix2gestalt 모델 체크포인트 경로')
-    parser.add_argument('--sam_model', type=str, default='vit_h', help='SAM 모델 타입 (vit_b, vit_l, vit_h)')
-    parser.add_argument('--guidance_scale', type=float, default=2.0, help='확산 가이던스 스케일')
-    parser.add_argument('--ddim_steps', type=int, default=50, help='확산 스텝 수')
-    parser.add_argument('--grid_size', type=int, default=16, help='그리드 포인트의 간격 (작을수록 더 많은 포인트 생성)')
-    parser.add_argument('--num_gpus', type=int, default=8, help='사용할 GPU 수')
-    parser.add_argument('--max_images', type=int, default=None, help='처리할 최대 이미지 수 (기본값: 모든 이미지)')
-    args = parser.parse_args()
+    p=argparse.ArgumentParser()
+    p.add_argument('--input_dir',required=True, help='입력 이미지가 있는 디렉토리')
+    p.add_argument('--output_dir',required=True, help='결과를 저장할 디렉토리')
+    p.add_argument('--model_config', default=None, help='모델 설정 파일 경로')
+    p.add_argument('--model_ckpt', default=None, help='모델 체크포인트 파일 경로')
+    p.add_argument('--sam_model', default='vit_h', help='SAM 모델 타입 (vit_h, vit_l, vit_b)')
+    p.add_argument('--guidance_scale', type=float, default=2.0, help='가이던스 스케일')
+    p.add_argument('--ddim_steps', type=int, default=50, help='DDIM 스텝 수')
+    p.add_argument('--num_gpus', type=int, default=4, help='사용할 GPU 수')
+    p.add_argument('--max_images', type=int, default=None, help='처리할 최대 이미지 수')
+    args=p.parse_args()
     
-    create_amodal_enhanced_dataset_distributed(
-        args.input_dir,
-        args.output_dir,
-        args.model_config,
-        args.model_ckpt,
-        args.sam_model,
-        args.guidance_scale,
-        args.ddim_steps,
-        args.grid_size,
-        args.num_gpus,
+    create_dataset(
+        args.input_dir, args.output_dir,
+        args.model_config, args.model_ckpt,
+        args.sam_model, args.guidance_scale,
+        args.ddim_steps, args.num_gpus,
         args.max_images
     )
 
-if __name__ == "__main__":
-    # 멀티프로세싱 시작 방법 설정 (윈도우에서 필요)
+if __name__=='__main__':
     mp.set_start_method('spawn', force=True)
     main()
