@@ -1,3 +1,12 @@
+'''
+CLI
+1. SAM 자동 마스크 생성을 사용하는 경우
+python test.py --mode sam_auto --input_path /path/to/your/input_image.jpg --output_dir ./results
+2. 기존 마스크 이미지를 사용하는 경우
+python test.py --mode existing_mask --input_path ~/volum1/cy/pix2gestalt/results/dataset8/debug/Places365_test_00000138/orig.png --mask_path ~/volum1/cy/pix2gestalt/results/dataset8/debug/Places365_test_00000138/masks/3.png --output_dir ~/volum1/cy/pix2gestalt/pix2gestalt/results/138
+
+'''
+
 import numpy as np
 import torch
 from PIL import Image
@@ -82,7 +91,7 @@ def main():
         visible_mask=visible_mask,
         model=model,
         guidance_scale=2.0,
-        n_samples=4,  # 여러 샘플 생성
+        n_samples=1,  # 여러 샘플 생성
         ddim_steps=50,
         device=device
     )

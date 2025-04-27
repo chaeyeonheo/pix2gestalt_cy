@@ -1,0 +1,32 @@
+# 데이터 관련 설정
+train_dir: "/path/to/train_dataset"   # 훈련 데이터 폴더
+val_dir: "/path/to/val_dataset"       # 검증 데이터 폴더
+img_size: 256
+n_max_completions: 5
+
+# Transformer 모델 관련 설정
+d_model: 256  # Transformer 모델 차원
+nhead: 8  # 멀티헤드 어텐션의 헤드 수
+num_encoder_layers: 6  # 인코더 레이어 수 
+num_decoder_layers: 6  # 디코더 레이어 수
+dim_feedforward: 1024  # 피드포워드 네트워크의 히든 차원
+dropout: 0.1  # 드롭아웃 비율
+
+# 훈련 관련 설정
+batch_size: 8
+epochs: 50
+lr: 0.0001
+lpips_weight: 1.0
+grad_clip: 1.0
+num_workers: 4
+seed: 42
+
+# 분산 훈련 관련 설정
+gpus: 6  # 6개의 GPU 사용
+
+# 출력 및 로깅 관련 설정
+checkpoint_dir: "checkpoints/transformer_run1"
+log_dir: "logs/transformer_run1"
+vis_dir: "visualizations/transformer_run1"
+log_interval: 10
+vis_interval: 100
